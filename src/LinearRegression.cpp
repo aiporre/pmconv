@@ -40,21 +40,62 @@ static torch::Tensor linear_regression(Variable input, Variable weight, Variable
 
 int main(){
    std::cout << "Hello, Linear Regression!" << std::endl;
-     torch::manual_seed(0);
-    // create some random data
-    auto x = torch::rand({10, 3});
-    auto w = torch::rand({3, 2});
-    auto b = torch::rand({2});
-    // compute the output
-    auto y = linear_regression(x, w, b);
-    std::cout << "Output: " << y << std::endl;
-     // compute the gradients
-    auto grad_output = torch::rand({10, 2});
-    auto grad_input = linear_regression::backward(nullptr, {grad_output})[0];
-    std::cout << "Gradient w.r.t input: " << grad_input << std::endl;
-     auto grad_weight = linear_regression::backward(nullptr, {grad_output})[1];
-    std::cout << "Gradient w.r.t weight: " << grad_weight << std::endl;
-     auto grad_bias = linear_regression::backward(nullptr, {grad_output})[2];
-    std::cout << "Gradient w.r.t bias: " << grad_bias << std::endl;
-     return 0;
+   torch::manual_seed(0);
+   // create some random data
+   const int64_t N = 10;
+   auto x = torch::rand({N, 2});
+   auto w_true = torch::tensor({{2.0, 3.0}, {4.0, 5.0}});
+   auto b_true = torch::tensor({1.0, 2.0});
+   // fake data y = x * w_true + b_true
+   auto y_true = x.mm(w_true) + b_true;
+
+   // create parameters for linear regression
+//   auto w = torch::zeros({2, 2}, torch::TensorOptions().requires_grad(true));
+//   auto b = torch::zeros({2}, torch::TensorOptions().requires_grad(true));
+   auto w = torch::randn({2, 2}, torch::TensorOptions().requires_grad(true));
+   auto b = torch::randn({2}, torch::TensorOptions().requires_grad(true));
+
+   // training loop
+   //   const double lr = 0.1;
+   // AdamW optimizer
+   torch::optim::AdamW optimizer(
+       {w, b},
+       torch::optim::AdamWOptions(/*lr=*/1e-1).weight_decay(1e-2)
+   );
+
+   for (int epoch = 0; epoch < 3000; ++epoch) {
+       // foward pass
+       auto y_pred = linear_regression(x, w, b);
+       auto loss = torch::mse_loss(y_pred, y_true);
+       // backward pass
+       optimizer.zero_grad();
+       loss.backward();
+       optimizer.step();
+
+
+       //       // update parameters
+       //       {
+       //           torch::NoGradGuard no_grad;
+       //           // update w and b using gradient descent
+       //           w -= lr * w.grad();
+       //           b -= lr * b.grad();
+       //       }
+       //
+       //       // zero gradients
+       //       w.grad().zero_();
+       //       b.grad().zero_();
+       if (epoch % 50 == 0) {
+            std::cout << "Epoch [" << epoch << "/100], Loss: " << loss.item<double>() << std::endl;
+       }
+
+   }
+   // print the learned parameters
+   std::cout << "Learned weight:\n" << w << std::endl;
+   std::cout << "Learned bias:\n" << b << std::endl;
+
+   // print the true parameters
+   std::cout << "True weight:\n" << w_true << std::endl;
+   std::cout << "True bias:\n" << b_true << std::endl;
+
+   return 0;
 }
