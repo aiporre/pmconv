@@ -7,13 +7,14 @@ Usage:
     python setup.py build_ext --inplace  # build in-place (for quick tests)
 """
 
-from setuptools import setup
+from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CppExtension, BuildExtension
 
 setup(
-    name="pmconv_ext",
-    version="0.1.0",
-    description="SplineCNN tensor ops for pmconv (C++ / PyTorch)",
+    name="pmconv",
+    version="0.2.0",
+    description="Tensor-valued SplineCNN tensor ops for pmconv (C++ / PyTorch)",
+    packages=find_packages(exclude=["tests*"]),
     ext_modules=[
         CppExtension(
             name="pmconv_ext",

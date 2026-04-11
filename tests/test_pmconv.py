@@ -368,5 +368,262 @@ class TestTorchOpsRegistration:
         assert y.shape == (N, Cout)
 
 
+# ===========================================================================
+# Python-level API — pmconv package (SplineSupport / spline_basis /
+# spline_weighting / spline_conv) mirroring pytorch_spline_conv structure
+# ===========================================================================
+
+from pmconv import (
+    SplineSupport,
+    spline_basis,
+    spline_weighting,
+    spline_conv,
+)
+
+
+class TestSplineSupport:
+    """Tests for SplineSupport (the S object) — kernel domain structure."""
+
+    def test_basic_creation(self):
+        S = SplineSupport(k_per_dim=[4, 4], degree=1)
+        assert S.Q == 16
+        assert S.d == 2
+
+    def test_1d_creation(self):
+        S = SplineSupport(k_per_dim=[6], degree=3)
+        assert S.Q == 6
+        assert S.d == 1
+
+    def test_multi_index_shape(self):
+        S = SplineSupport(k_per_dim=[3, 4], degree=1)
+        assert S.multi_index.shape == (12, 2)
+
+    def test_multi_index_dtype(self):
+        S = SplineSupport(k_per_dim=[4, 4], degree=1)
+        assert S.multi_index.dtype == torch.int64
+
+    def test_multi_index_deterministic(self):
+        S1 = SplineSupport(k_per_dim=[3, 3], degree=1)
+        S2 = SplineSupport(k_per_dim=[3, 3], degree=1)
+        assert torch.equal(S1.multi_index, S2.multi_index)
+
+    def test_repr(self):
+        S = SplineSupport(k_per_dim=[4, 4], degree=1)
+        r = repr(S)
+        assert "SplineSupport" in r
+        assert "k_per_dim=[4, 4]" in r
+
+    def test_invalid_degree_raises(self):
+        with pytest.raises(ValueError, match="degree must be >= 1"):
+            SplineSupport(k_per_dim=[4], degree=0)
+
+    def test_invalid_k_too_small_raises(self):
+        with pytest.raises(ValueError, match="must be >= degree\\+1"):
+            SplineSupport(k_per_dim=[2], degree=3)  # 2 < 3+1=4
+
+    def test_empty_k_per_dim_raises(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            SplineSupport(k_per_dim=[], degree=1)
+
+
+class TestSplineBasis:
+    """Tests for spline_basis — mirrors pytorch_spline_conv basis module."""
+
+    def _make(self, E=10, d=2, k=4, degree=1):
+        S = SplineSupport(k_per_dim=[k] * d, degree=degree)
+        edge_attr = torch.rand(E, d)
+        return edge_attr, S
+
+    def test_output_shapes(self):
+        E, d, k = 10, 2, 4
+        edge_attr, S = self._make(E, d, k)
+        phi, mi = spline_basis(edge_attr, S)
+        assert phi.shape == (E, S.Q)
+        assert mi.shape == (S.Q, d)
+
+    def test_multi_index_same_as_support(self):
+        edge_attr, S = self._make()
+        _, mi = spline_basis(edge_attr, S)
+        assert torch.equal(mi, S.multi_index)
+
+    def test_partition_of_unity(self):
+        """Σ_q Φ_q(u_e) = 1 for all e — partition of unity."""
+        E, d, k = 40, 2, 5
+        edge_attr, S = self._make(E, d, k, degree=1)
+        phi, _ = spline_basis(edge_attr, S)
+        row_sums = phi.sum(dim=1)
+        assert torch.allclose(row_sums, torch.ones(E), atol=1e-5)
+
+    def test_non_negative(self):
+        edge_attr, S = self._make(E=30, d=2, k=6, degree=3)
+        phi, _ = spline_basis(edge_attr, S)
+        assert (phi >= -1e-6).all()
+
+    def test_dtype_preserved(self):
+        S = SplineSupport(k_per_dim=[4], degree=1)
+        edge_attr = torch.rand(5, 1, dtype=torch.float64)
+        phi, _ = spline_basis(edge_attr, S)
+        assert phi.dtype == torch.float64
+
+
+class TestSplineWeighting:
+    """Tests for spline_weighting — tensor-valued kernel K_S application."""
+
+    def _make(self, E=10, Q=16, Cin=3, Cout=5):
+        x_src = torch.rand(E, Cin)
+        weight = torch.rand(Q, Cin, Cout)
+        phi = torch.rand(E, Q)
+        return x_src, weight, phi
+
+    def test_output_shape(self):
+        x_src, weight, phi = self._make(E=10, Q=16, Cin=3, Cout=5)
+        msg = spline_weighting(x_src, weight, phi)
+        assert msg.shape == (10, 5)
+
+    def test_consistency_with_einsum(self):
+        """msg = bmm(x_src, einsum(phi, weight)) — verify against reference."""
+        E, Q, Cin, Cout = 8, 12, 3, 4
+        x_src, weight, phi = self._make(E, Q, Cin, Cout)
+        # Reference: assemble kernel then apply
+        g_ref = torch.einsum("eq,qcd->ecd", phi, weight)  # [E, Cin, Cout]
+        msg_ref = torch.bmm(x_src.unsqueeze(1), g_ref).squeeze(1)  # [E, Cout]
+        msg_ext = spline_weighting(x_src, weight, phi)
+        assert torch.allclose(msg_ext, msg_ref, atol=1e-5)
+
+    def test_zero_weights(self):
+        x_src = torch.rand(5, 3)
+        weight = torch.zeros(8, 3, 4)
+        phi = torch.rand(5, 8)
+        msg = spline_weighting(x_src, weight, phi)
+        assert torch.allclose(msg, torch.zeros(5, 4))
+
+    def test_autograd_w(self):
+        """Gradient flows through weight."""
+        E, Q, Cin, Cout = 4, 6, 2, 3
+        x_src = torch.rand(E, Cin)
+        phi = torch.rand(E, Q)
+        weight = torch.rand(Q, Cin, Cout, requires_grad=True)
+        msg = spline_weighting(x_src, weight, phi)
+        msg.sum().backward()
+        assert weight.grad is not None
+        assert weight.grad.shape == weight.shape
+
+    def test_autograd_x_src(self):
+        """Gradient flows through x_src."""
+        E, Q, Cin, Cout = 4, 6, 2, 3
+        x_src = torch.rand(E, Cin, requires_grad=True)
+        phi = torch.rand(E, Q)
+        weight = torch.rand(Q, Cin, Cout)
+        msg = spline_weighting(x_src, weight, phi)
+        msg.sum().backward()
+        assert x_src.grad is not None
+        assert x_src.grad.shape == x_src.shape
+
+
+class TestSplineConv:
+    """Tests for spline_conv — full tensor-valued SplineCNN convolution."""
+
+    def _small_graph(self, N=4, Cin=3, Cout=5, d=2, E=8, k=4, degree=1):
+        edge_index = torch.randint(0, N, (2, E), dtype=torch.int64)
+        edge_attr = torch.rand(E, d)
+        x = torch.rand(N, Cin)
+        S = SplineSupport(k_per_dim=[k] * d, degree=degree)
+        W = torch.rand(S.Q, Cin, Cout)
+        graph = GraphInput(edge_index, edge_attr, x)
+        return graph, W, S
+
+    def test_output_shape(self):
+        graph, W, S = self._small_graph(N=6, Cin=3, Cout=7)
+        y = spline_conv(graph, W, S)
+        assert y.shape == (6, 7)
+
+    def test_no_nan(self):
+        graph, W, S = self._small_graph()
+        y = spline_conv(graph, W, S)
+        assert not torch.isnan(y).any()
+
+    def test_isolated_node_zero(self):
+        """A node with no incoming edges must produce zero output."""
+        N, E, Cin, Cout, d, k = 4, 3, 2, 3, 1, 4
+        edge_index = torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.int64)
+        edge_attr = torch.rand(E, d)
+        x = torch.rand(N, Cin)
+        S = SplineSupport(k_per_dim=[k], degree=1)
+        W = torch.rand(S.Q, Cin, Cout)
+        graph = GraphInput(edge_index, edge_attr, x)
+        y = spline_conv(graph, W, S)
+        # Node 3 has no incoming edge
+        assert torch.allclose(y[3], torch.zeros(Cout), atol=1e-6)
+
+    def test_norm_false_vs_true_shape(self):
+        graph, W, S = self._small_graph()
+        y_norm = spline_conv(graph, W, S, norm=True)
+        y_none = spline_conv(graph, W, S, norm=False)
+        assert y_norm.shape == y_none.shape
+
+    def test_matches_low_level_api(self):
+        """spline_conv must match direct pmconv_ext.spline_convolution."""
+        N, E, d, Cin, Cout, k = 5, 10, 2, 3, 4, 4
+        edge_index = torch.randint(0, N, (2, E), dtype=torch.int64)
+        edge_attr = torch.rand(E, d)
+        x = torch.rand(N, Cin)
+        S = SplineSupport(k_per_dim=[k] * d, degree=1)
+        W = torch.rand(S.Q, Cin, Cout)
+        graph = GraphInput(edge_index, edge_attr, x)
+
+        y_new = spline_conv(graph, W, S, norm=True)
+        y_old = spline_convolution(graph, W, degree=1, k_per_dim=[k] * d,
+                                   normalize=True)
+        assert torch.allclose(y_new, y_old, atol=1e-5), \
+            f"Max diff: {(y_new - y_old).abs().max()}"
+
+    def test_autograd_weight(self):
+        """Gradient flows through W (tensor-valued kernel)."""
+        N, E, d, Cin, Cout, k = 4, 6, 2, 3, 4, 4
+        edge_index = torch.randint(0, N, (2, E), dtype=torch.int64)
+        edge_attr = torch.rand(E, d)
+        x = torch.rand(N, Cin)
+        S = SplineSupport(k_per_dim=[k] * d, degree=1)
+        W = torch.rand(S.Q, Cin, Cout, requires_grad=True)
+        graph = GraphInput(edge_index, edge_attr, x)
+
+        y = spline_conv(graph, W, S)
+        y.sum().backward()
+        assert W.grad is not None
+        assert W.grad.shape == (S.Q, Cin, Cout)
+
+    def test_root_weight(self):
+        """Optional root_weight term is added correctly."""
+        N, E, Cin, Cout, d, k = 4, 6, 3, 5, 2, 4
+        edge_index = torch.randint(0, N, (2, E), dtype=torch.int64)
+        edge_attr = torch.rand(E, d)
+        x = torch.rand(N, Cin)
+        S = SplineSupport(k_per_dim=[k] * d, degree=1)
+        W = torch.rand(S.Q, Cin, Cout)
+        rw = torch.rand(Cin, Cout)
+        graph = GraphInput(edge_index, edge_attr, x)
+
+        y_no_rw = spline_conv(graph, W, S)
+        y_rw = spline_conv(graph, W, S, root_weight=rw)
+        expected_diff = x @ rw
+        assert torch.allclose(y_rw - y_no_rw, expected_diff, atol=1e-5)
+
+    def test_bias(self):
+        """Optional bias is added to every output node."""
+        N, E, Cin, Cout, d, k = 4, 6, 3, 5, 2, 4
+        edge_index = torch.randint(0, N, (2, E), dtype=torch.int64)
+        edge_attr = torch.rand(E, d)
+        x = torch.rand(N, Cin)
+        S = SplineSupport(k_per_dim=[k] * d, degree=1)
+        W = torch.rand(S.Q, Cin, Cout)
+        b = torch.rand(Cout)
+        graph = GraphInput(edge_index, edge_attr, x)
+
+        y_no_b = spline_conv(graph, W, S)
+        y_b = spline_conv(graph, W, S, bias=b)
+        assert torch.allclose(y_b - y_no_b, b.unsqueeze(0).expand(N, -1),
+                               atol=1e-5)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
